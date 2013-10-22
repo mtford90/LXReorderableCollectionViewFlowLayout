@@ -7,7 +7,6 @@
 
 #import "LXReorderableCollectionViewFlowLayout.h"
 #import <QuartzCore/QuartzCore.h>
-#import <objc/runtime.h>
 
 #define LX_FRAMES_PER_SECOND 60.0
 
@@ -28,20 +27,6 @@ typedef NS_ENUM(NSInteger, LXScrollingDirection) {
 
 static NSString * const kLXScrollingDirectionKey = @"LXScrollingDirection";
 static NSString * const kLXCollectionViewKeyPath = @"collectionView";
-
-@interface CADisplayLink (LX_userInfo)
-@property (nonatomic, copy) NSDictionary *LX_userInfo;
-@end
-
-@implementation CADisplayLink (LX_userInfo)
-- (void) setLX_userInfo:(NSDictionary *) LX_userInfo {
-    objc_setAssociatedObject(self, "LX_userInfo", LX_userInfo, OBJC_ASSOCIATION_COPY);
-}
-
-- (NSDictionary *) LX_userInfo {
-    return objc_getAssociatedObject(self, "LX_userInfo");
-}
-@end
 
 @interface UICollectionViewCell (LXReorderableCollectionViewFlowLayout)
 
@@ -65,9 +50,11 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
 
 @property (strong, nonatomic) NSIndexPath *selectedItemIndexPath;
 @property (strong, nonatomic) UIView *currentView;
+@property (weak, nonatomic) UICollectionViewCell* currentCollectionViewCell;
 @property (assign, nonatomic) CGPoint currentViewCenter;
 @property (assign, nonatomic) CGPoint panTranslationInCollectionView;
-@property (strong, nonatomic) CADisplayLink *displayLink;
+@property (strong, nonatomic) NSTimer *scrollingTimer;
+@property (assign, nonatomic) BOOL hasPassedOverBoundaryOnce;
 
 @property (assign, nonatomic, readonly) id<LXReorderableCollectionViewDataSource> dataSource;
 @property (assign, nonatomic, readonly) id<LXReorderableCollectionViewDelegateFlowLayout> delegate;
@@ -100,9 +87,6 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
                                                                     action:@selector(handlePanGesture:)];
     _panGestureRecognizer.delegate = self;
     [self.collectionView addGestureRecognizer:_panGestureRecognizer];
-
-    // Useful in multiple scenarios: one common scenario being when the Notification Center drawer is pulled down
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleApplicationWillResignActive:) name: UIApplicationWillResignActiveNotification object:nil];
 }
 
 - (id)init {
@@ -126,7 +110,6 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
 - (void)dealloc {
     [self invalidatesScrollTimer];
     [self removeObserver:self forKeyPath:kLXCollectionViewKeyPath];
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillResignActiveNotification object:nil];
 }
 
 - (void)applyLayoutAttributes:(UICollectionViewLayoutAttributes *)layoutAttributes {
@@ -158,10 +141,8 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
     
     self.selectedItemIndexPath = newIndexPath;
     
-    if ([self.dataSource respondsToSelector:@selector(collectionView:itemAtIndexPath:willMoveToIndexPath:)]) {
-        [self.dataSource collectionView:self.collectionView itemAtIndexPath:previousIndexPath willMoveToIndexPath:newIndexPath];
-    }
-
+    [self.dataSource collectionView:self.collectionView itemAtIndexPath:previousIndexPath willMoveToIndexPath:newIndexPath];
+    
     __weak typeof(self) weakSelf = self;
     [self.collectionView performBatchUpdates:^{
         __strong typeof(self) strongSelf = weakSelf;
@@ -169,43 +150,39 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
             [strongSelf.collectionView deleteItemsAtIndexPaths:@[ previousIndexPath ]];
             [strongSelf.collectionView insertItemsAtIndexPaths:@[ newIndexPath ]];
         }
-    } completion:^(BOOL finished) {
-        __strong typeof(self) strongSelf = weakSelf;
-        if ([strongSelf.dataSource respondsToSelector:@selector(collectionView:itemAtIndexPath:didMoveToIndexPath:)]) {
-            [strongSelf.dataSource collectionView:strongSelf.collectionView itemAtIndexPath:previousIndexPath didMoveToIndexPath:newIndexPath];
-        }
-    }];
+    } completion:nil];
 }
 
 - (void)invalidatesScrollTimer {
-    if (!self.displayLink.paused) {
-        [self.displayLink invalidate];
+    if (self.scrollingTimer.isValid) {
+        [self.scrollingTimer invalidate];
     }
-    self.displayLink = nil;
+    self.scrollingTimer = nil;
 }
 
 - (void)setupScrollTimerInDirection:(LXScrollingDirection)direction {
-    if (!self.displayLink.paused) {
-        LXScrollingDirection oldDirection = [self.displayLink.LX_userInfo[kLXScrollingDirectionKey] integerValue];
-
+    if (self.scrollingTimer.isValid) {
+        LXScrollingDirection oldDirection = [self.scrollingTimer.userInfo[kLXScrollingDirectionKey] integerValue];
+        
         if (direction == oldDirection) {
             return;
         }
     }
     
     [self invalidatesScrollTimer];
-
-    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleScroll:)];
-    self.displayLink.LX_userInfo = @{ kLXScrollingDirectionKey : @(direction) };
-
-    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    
+    self.scrollingTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / LX_FRAMES_PER_SECOND
+                                                           target:self
+                                                         selector:@selector(handleScroll:)
+                                                         userInfo:@{ kLXScrollingDirectionKey : @(direction) }
+                                                          repeats:YES];
 }
 
 #pragma mark - Target/Action methods
 
 // Tight loop, allocate memory sparely, even if they are stack allocation.
-- (void)handleScroll:(CADisplayLink *)displayLink {
-    LXScrollingDirection direction = (LXScrollingDirection)[displayLink.LX_userInfo[kLXScrollingDirectionKey] integerValue];
+- (void)handleScroll:(NSTimer *)timer {
+    LXScrollingDirection direction = (LXScrollingDirection)[timer.userInfo[kLXScrollingDirectionKey] integerValue];
     if (direction == LXScrollingDirectionUnknown) {
         return;
     }
@@ -284,25 +261,27 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
             
             UICollectionViewCell *collectionViewCell = [self.collectionView cellForItemAtIndexPath:self.selectedItemIndexPath];
             
+            self.currentCollectionViewCell = collectionViewCell;
             self.currentView = [[UIView alloc] initWithFrame:collectionViewCell.frame];
             
-            collectionViewCell.highlighted = YES;
-            UIImageView *highlightedImageView = [[UIImageView alloc] initWithImage:[collectionViewCell LX_rasterizedImage]];
-            highlightedImageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            highlightedImageView.alpha = 1.0f;
+            //collectionViewCell.highlighted = YES;
+            //UIImageView *highlightedImageView = [[UIImageView alloc] initWithImage:[collectionViewCell LX_rasterizedImage]];
+            //highlightedImageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            //highlightedImageView.alpha = 1.0f;
             
-            collectionViewCell.highlighted = NO;
+            //collectionViewCell.highlighted = NO;
             UIImageView *imageView = [[UIImageView alloc] initWithImage:[collectionViewCell LX_rasterizedImage]];
             imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            imageView.alpha = 0.0f;
+            //imageView.alpha = 0.0f;
             
             [self.currentView addSubview:imageView];
-            [self.currentView addSubview:highlightedImageView];
+            //[self.currentView addSubview:highlightedImageView];
             [self.collectionView addSubview:self.currentView];
             
             self.currentViewCenter = self.currentView.center;
             
             __weak typeof(self) weakSelf = self;
+            
             [UIView
              animateWithDuration:0.3
              delay:0.0
@@ -311,66 +290,115 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
                  __strong typeof(self) strongSelf = weakSelf;
                  if (strongSelf) {
                      strongSelf.currentView.transform = CGAffineTransformMakeScale(1.1f, 1.1f);
-                     highlightedImageView.alpha = 0.0f;
-                     imageView.alpha = 1.0f;
+                     //highlightedImageView.alpha = 0.0f;
+                     //imageView.alpha = 1.0f;
                  }
              }
              completion:^(BOOL finished) {
                  __strong typeof(self) strongSelf = weakSelf;
                  if (strongSelf) {
-                     [highlightedImageView removeFromSuperview];
+                     //[highlightedImageView removeFromSuperview];
                      
                      if ([strongSelf.delegate respondsToSelector:@selector(collectionView:layout:didBeginDraggingItemAtIndexPath:)]) {
-                         [strongSelf.delegate collectionView:strongSelf.collectionView layout:strongSelf didBeginDraggingItemAtIndexPath:strongSelf.selectedItemIndexPath];
+                         [strongSelf.delegate collectionView:strongSelf.collectionView
+                                                      layout:strongSelf
+                             didBeginDraggingItemAtIndexPath:strongSelf.selectedItemIndexPath];
                      }
                  }
              }];
             
             [self invalidateLayout];
         } break;
-        case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateEnded: {
             NSIndexPath *currentIndexPath = self.selectedItemIndexPath;
-            
+
             if (currentIndexPath) {
-                if ([self.delegate respondsToSelector:@selector(collectionView:layout:willEndDraggingItemAtIndexPath:)]) {
-                    [self.delegate collectionView:self.collectionView layout:self willEndDraggingItemAtIndexPath:currentIndexPath];
+                BOOL returnItemToIndexPath = YES;
+                if ([self.delegate respondsToSelector:@selector(collectionView:layout:willEndDraggingItemAndReturnItemToIndexPath:currentView:outsideBoundary:)]) {
+                    //NSLog(@"View center is %f,%f",self.currentViewCenter.x+self.panTranslationInCollectionView.x,+self.currentViewCenter.y+self.panTranslationInCollectionView.y);
+                    //NSLog(@"Current view is %@",self.currentView);
+                    returnItemToIndexPath = [self.delegate collectionView:self.collectionView layout:self willEndDraggingItemAndReturnItemToIndexPath:currentIndexPath currentView:self.currentView outsideBoundary:[self currentViewIsOutsideBoundary]];
                 }
                 
-                self.selectedItemIndexPath = nil;
-                self.currentViewCenter = CGPointZero;
-                
-                UICollectionViewLayoutAttributes *layoutAttributes = [self layoutAttributesForItemAtIndexPath:currentIndexPath];
-                
-                __weak typeof(self) weakSelf = self;
-                [UIView
-                 animateWithDuration:0.3
-                 delay:0.0
-                 options:UIViewAnimationOptionBeginFromCurrentState
-                 animations:^{
-                     __strong typeof(self) strongSelf = weakSelf;
-                     if (strongSelf) {
-                         strongSelf.currentView.transform = CGAffineTransformMakeScale(1.0f, 1.0f);
-                         strongSelf.currentView.center = layoutAttributes.center;
-                     }
-                 }
-                 completion:^(BOOL finished) {
-                     __strong typeof(self) strongSelf = weakSelf;
-                     if (strongSelf) {
-                         [strongSelf.currentView removeFromSuperview];
-                         strongSelf.currentView = nil;
-                         [strongSelf invalidateLayout];
-                         
-                         if ([strongSelf.delegate respondsToSelector:@selector(collectionView:layout:didEndDraggingItemAtIndexPath:)]) {
-                             [strongSelf.delegate collectionView:strongSelf.collectionView layout:strongSelf didEndDraggingItemAtIndexPath:currentIndexPath];
+                if (returnItemToIndexPath) {
+                    UICollectionViewLayoutAttributes *layoutAttributes = [self layoutAttributesForItemAtIndexPath:currentIndexPath];
+                    
+                    __weak typeof(self) weakSelf = self;
+                    [UIView
+                     animateWithDuration:0.3
+                     delay:0.0
+                     options:UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{
+                         __strong typeof(self) strongSelf = weakSelf;
+                         if (strongSelf) {
+                             strongSelf.currentView.transform = CGAffineTransformMakeScale(1.0f, 1.0f);
+                             strongSelf.currentView.center = layoutAttributes.center;
                          }
                      }
-                 }];
-            }
+                     completion:^(BOOL finished) {
+                         __strong typeof(self) strongSelf = weakSelf;
+                         if (strongSelf) {
+                             self.selectedItemIndexPath = nil;
+                             self.currentViewCenter = CGPointZero;
+                             [strongSelf invalidateLayout];
+                             // HACK/TODO: This is a hack that prevents any remaining flashing when pan gesture
+                             // ends. Ideally, want to wait until layout cycle ends (and hence layout has been
+                             // updated) but not sure how to do this. This fixes it by fading currentView very quickly to
+                             // hide the flash...
+                             [UIView
+                              animateWithDuration:0.1
+                              delay:0.0
+                              options:UIViewAnimationOptionBeginFromCurrentState
+                              animations:^{
+                                  strongSelf.currentView.alpha = 0.0;
+                              } completion:^(BOOL finished) {
+                                  [strongSelf.currentView removeFromSuperview];
+                                  if ([strongSelf.delegate respondsToSelector:@selector(collectionView:layout:didEndDraggingItemAtIndexPath:)]) {
+                                      [strongSelf.delegate collectionView:strongSelf.collectionView layout:strongSelf didEndDraggingItemAtIndexPath:currentIndexPath];
+                                  }
+                                  strongSelf.currentView = nil;
+                              }];
+                             
+                             
+                         }
+                     }];
+                }
+                else {
+                    [self.currentView removeFromSuperview];
+                    self.selectedItemIndexPath = nil;
+                    self.currentViewCenter = CGPointZero;
+                    self.currentView = nil;
+                }
+                }
+                
+   
         } break;
             
         default: break;
     }
+}
+
+- (BOOL)currentViewIsOutsideBoundary {
+    if ([self.delegate respondsToSelector:@selector(offscreenBoundaryForCollectionView:)]) {
+        CGPoint offset = [self.delegate offscreenBoundaryForCollectionView:self.collectionView];
+        NSInteger h = self.currentView.frame.size.height;
+        NSInteger w = self.currentView.frame.size.width;
+        NSInteger leftBoundary = (w / 2) - offset.x;
+        NSInteger rightBoundary = self.collectionView.frame.size.width - ((w / 2)-offset.x);
+        NSInteger topBoundary = (h / 2) - offset.y;
+        NSInteger bottomBoundary = self.collectionView.frame.size.height - ((h / 2)-offset.y);
+        CGPoint pannedCenter;
+        pannedCenter.x = self.currentViewCenter.x+self.panTranslationInCollectionView.x;
+        pannedCenter.y = self.currentViewCenter.y+self.panTranslationInCollectionView.y;
+        //NSLog(@"View center is %f,%f",pannedCenter.x,pannedCenter.y);
+        //NSLog(@"lb: %d; rb: %d; tb: %d; bb: %d",leftBoundary,rightBoundary,topBoundary,bottomBoundary);
+        BOOL boundaryCondition = (pannedCenter.x <= leftBoundary ||
+                                  pannedCenter.x >= rightBoundary ||
+                                  pannedCenter.y <= topBoundary ||
+                                  pannedCenter.y >= bottomBoundary);
+        return boundaryCondition;
+    }
+    return NO;
 }
 
 - (void)handlePanGesture:(UIPanGestureRecognizer *)gestureRecognizer {
@@ -406,9 +434,29 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
                     }
                 } break;
             }
+            BOOL outsideBoundary = [self currentViewIsOutsideBoundary];
+            if (outsideBoundary &&
+                !self.hasPassedOverBoundaryOnce) {
+                NSLog(@"Hit the boundary leaving!!");
+                if ([self.delegate respondsToSelector:@selector(collectionView:layout:didHitOffscreenBoundaryDraggingItemAtIndexPath:leavingBoundary:currentView:)]) {
+                    [self.delegate collectionView:self.collectionView layout:self didHitOffscreenBoundaryDraggingItemAtIndexPath:self.selectedItemIndexPath leavingBoundary:YES currentView:self.currentView];
+                }
+                self.hasPassedOverBoundaryOnce = YES;
+            }
+            else {
+                if (self.hasPassedOverBoundaryOnce && !outsideBoundary) {
+                    NSLog(@"Hit the boundary entering!!");
+                    if ([self.delegate respondsToSelector:@selector(collectionView:layout:didHitOffscreenBoundaryDraggingItemAtIndexPath:leavingBoundary:currentView:)]) {
+                        [self.delegate collectionView:self.collectionView layout:self didHitOffscreenBoundaryDraggingItemAtIndexPath:self.selectedItemIndexPath leavingBoundary:NO currentView:self.currentView];
+                    }
+                    self.hasPassedOverBoundaryOnce = NO;
+                }
+            }
+            
+            //NSLog(@"Current view is %@",self.currentView);
         } break;
-        case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateEnded: {
+            self.hasPassedOverBoundaryOnce = NO;
             [self invalidatesScrollTimer];
         } break;
         default: {
@@ -482,13 +530,6 @@ static NSString * const kLXCollectionViewKeyPath = @"collectionView";
             [self invalidatesScrollTimer];
         }
     }
-}
-
-#pragma mark - Notifications
-
-- (void)handleApplicationWillResignActive:(NSNotification *)notification {
-    self.panGestureRecognizer.enabled = NO;
-    self.panGestureRecognizer.enabled = YES;
 }
 
 #pragma mark - Depreciated methods
